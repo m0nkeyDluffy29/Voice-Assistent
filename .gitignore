@@ -1,0 +1,45 @@
+# ── Virtual environment ───────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Your personal data (never commit this) ───────────────────
+data/
+models/
+
+# ── Python cache ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Environment variables ─────────────────────────────────────
+.env
+.env.*
+
+# ── OS files ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE / editor ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs and temp files ───────────────────────────────────────
+*.log
+*.tmp
+/tmp/
+
+# ── Audio temp files (from voice recording) ───────────────────
+*.wav
+*.mp3
+*.m4a
+
+# ── Tauri / frontend build (Phase 5) ─────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/src-tauri/target/
