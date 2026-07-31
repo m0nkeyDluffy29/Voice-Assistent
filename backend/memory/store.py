@@ -245,12 +245,15 @@ def search_memories(
 
 def search_summaries(query: str, top_k: int = 3) -> list[dict]:
     """Search weekly summaries by semantic similarity."""
-    return search_memories.__wrapped__(
-        query, top_k, collection_name="summaries"
-    ) if hasattr(search_memories, "__wrapped__") else _search_collection("summaries", query, top_k)
+    return _search_collection("summaries", query, top_k)
 
 
 def _search_collection(collection_name: str, query: str, top_k: int) -> list[dict]:
+    """
+    Generic collection search — used by Phase 3 retriever.py to search
+    any named ChromaDB collection (summaries, opinions, etc.)
+    Exported so retriever can import it directly.
+    """
     collection = get_collection(collection_name)
     count = collection.count()
     if count == 0:
