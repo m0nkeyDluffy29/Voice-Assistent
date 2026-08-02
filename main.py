@@ -432,7 +432,22 @@ def run_tts_test():
         print("        Install: pip install piper-tts sounddevice soundfile")
         print("        Fallback: pip install pyttsx3")
 
-
+def run_server(port: int = 8000):
+    """Start the FastAPI server for the desktop UI."""
+    try:
+        import uvicorn
+        print(f"\n[Server] Starting Personal AI Agent API on http://127.0.0.1:{port}")
+        print("[Server] Open the frontend (npm run dev) to use the desktop UI.")
+        print("[Server] Press Ctrl+C to stop.\n")
+        uvicorn.run(
+            "backend.api.server:app",
+            host      = "127.0.0.1",
+            port      = port,
+            reload    = False,
+            log_level = "info",
+        )
+    except ImportError:
+        print("[Agent] Phase 5 not installed. Run: pip install fastapi uvicorn python-multipart")
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -450,8 +465,12 @@ def main():
     parser.add_argument("--search",    metavar="QUERY")
     parser.add_argument("--force",     action="store_true")
     # Phase 4
+    # Phase 4
     parser.add_argument("--no-voice",  dest="no_voice",  action="store_true", help="Disable voice output in ASK mode")
     parser.add_argument("--ttstest",   dest="tts_test",  action="store_true", help="Test TTS engine and exit")
+    # Phase 5
+    parser.add_argument("--serve",     action="store_true", help="Start FastAPI server for desktop UI")
+    parser.add_argument("--port",      type=int, default=8000, help="Server port (default: 8000)")
     args = parser.parse_args()
 
     print(BANNER)
@@ -500,6 +519,10 @@ def main():
         run_search(args.search)
         return
 
+    # ── Phase 5: API server ──────────────────────────────────────────────────
+    if args.serve:
+        run_server(args.port)
+        return
     # ── Phase 4: TTS test ────────────────────────────────────────────────────
     if args.tts_test:
         run_tts_test()
