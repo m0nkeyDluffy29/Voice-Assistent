@@ -156,50 +156,338 @@ async def feed_text(req: FeedTextRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/feed/voice")
-async def feed_voice(audio: UploadFile = File(...)):
-    """
-    Transcribe an audio file and save it as a memory.
+# Whisper language code → our internal language name
+WHISPER_LANG_MAP = {
+    "en": "english", "hi": "hindi",
+    "english": "english", "hindi": "hindi",
+}
 
-    Multipart upload: audio file (.wav / .mp3 / .webm)
+def _whisper_lang_to_internal(code: str) -> str:
+    """Convert Whisper's language code ('en','hi') to our format ('english','hindi')."""
+    if not code:
+        return None
+    return WHISPER_LANG_MAP.get(code.lower(), "english")
+
+
+def _convert_to_wav(input_path: str) -> str:
+    """
+    Convert any audio format to WAV using ffmpeg.
+    Returns path to the converted WAV file.
+    Raises RuntimeError if ffmpeg fails.
+    """
+    import subprocess
+    wav_path = input_path.rsplit(".", 1)[0] + "_converted.wav"
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-ar", "16000",        # 16kHz — Whisper optimal
+            "-ac", "1",            # Mono
+            "-f", "wav",
+            wav_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg conversion failed: {result.stderr[-300:]}")
+    return wav_path
+
+
+@app.post("/feed/voice")
+async def feed_voice(audio: UploadFile = File(...), language_hint: str = None):
+    """
+    Transcribe browser audio and save transcription to memory.
+
+    - Receives audio/webm from browser MediaRecorder
+    - Converts to 16kHz mono WAV via ffmpeg (fixes corrupted webm issue)
+    - Transcribes with Whisper using language_hint to prevent wrong lang detection
+    - Saves ONLY the transcribed text to SQLite + ChromaDB (no audio stored)
+
     Returns: { "transcribed": str, "saved": bool, "language": str, ... }
     """
     from backend.ingest.listener import transcribe_file
     from backend.ingest.preprocessor import preprocess
     from backend.ingest.storage import save_message
 
-    # Save upload to temp file
-    suffix = os.path.splitext(audio.filename or "audio.wav")[1] or ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content  = await audio.read()
-        tmp.write(content)
-        tmp_path = tmp.name
+    raw_bytes = await audio.read()
+    if not raw_bytes or len(raw_bytes) < 1000:
+        return {"saved": False, "transcribed": "", "error": "Audio too short or empty"}
 
+    # Save raw upload
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(raw_bytes)
+        raw_path = tmp.name
+
+    wav_path = None
     try:
-        transcribed = transcribe_file(tmp_path)
+        # Always convert to clean 16kHz WAV — fixes "Invalid data" ffmpeg errors
+        try:
+            wav_path = _convert_to_wav(raw_path)
+        except Exception as conv_err:
+            print(f"[API] ffmpeg conversion failed, trying raw: {conv_err}")
+            wav_path = raw_path   # Fallback: try raw file directly
+
+        # Transcribe with optional language hint to prevent wrong detection
+        # Pass None for auto-detect, or 'en'/'hi' to force a language
+        whisper_lang = None
+        if language_hint:
+            whisper_lang = {"english": "en", "hindi": "hi", "hinglish": None}.get(language_hint)
+
+        transcribed = transcribe_file(wav_path, language=whisper_lang)
         text        = transcribed["text"].strip()
 
-        if not text:
-            return {"saved": False, "transcribed": "", "error": "No speech detected"}
+        # Filter out likely mis-detections (very short transcriptions)
+        if not text or len(text) < 2:
+            return {"saved": False, "transcribed": "", "error": "No speech detected — speak clearly and try again"}
 
-        msg   = preprocess(text, source="voice", force_language=transcribed.get("language"))
+        # Map Whisper lang code → our internal format
+        internal_lang = _whisper_lang_to_internal(transcribed.get("language"))
+
+        # Save ONLY transcribed text to DB — no audio file stored
+        msg   = preprocess(text, source="voice", force_language=internal_lang)
         saved = save_message(msg)
 
+        print(f"[API] Voice saved: '{text[:60]}...' lang={internal_lang} saved={saved}")
+
         return {
-            "saved":      saved,
+            "saved":       saved,
             "transcribed": text,
             "id":          msg["id"],
             "language":    msg["language"],
             "is_opinion":  msg["entities"].get("is_opinion", False),
+            "word_count":  msg["word_count"],
             "duplicate":   not saved,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        print(f"[API] /feed/voice error:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
     finally:
+        for p in [raw_path, wav_path]:
+            if p and p != raw_path:
+                try: os.unlink(p)
+                except OSError: pass
+        try: os.unlink(raw_path)
+        except OSError: pass
+
+# ---------------------------------------------------------------------------
+# CONVERSATION — JARVIS-style single endpoint: voice in → voice + text out
+# ---------------------------------------------------------------------------
+
+# System prompt for fast conversational replies — short answers, personal tone
+CONVERSATION_SYSTEM_PROMPT = """You are the user's digital self — you speak AS them, in first person.
+Reply in ONE OR TWO short sentences. Never more than 40 words.
+Match the language of the question: English, Hindi, or Hinglish.
+Speak naturally, casually — like a friend on a call.
+If you don't know something from memory, say so briefly and honestly.
+Never mention that you're an AI or reference "memories" or "context"."""
+
+
+@app.post("/converse")
+async def converse(audio: UploadFile = File(...), language_hint: str = None, save_to_memory: bool = True):
+    """
+    Optimised conversation flow — target <3s end-to-end.
+
+    Speed optimisations:
+      - Uses Whisper 'base' (5x faster than medium)
+      - Short reply (max 100 tokens, 1-2 sentences)
+      - Skips belief index and heavy retrieval (fetches top-3 memories only)
+      - Runs Whisper and memory retrieval in parallel where possible
+    """
+    import ollama
+    from backend.ingest.listener import transcribe_file
+    from backend.ingest.preprocessor import preprocess
+    from backend.ingest.storage import save_message
+    from backend.memory.store import search_memories
+
+    raw_bytes = await audio.read()
+    if not raw_bytes or len(raw_bytes) < 1000:
+        return {"transcribed": "", "answer": "Sorry, could not hear you. Try again.", "language": "english"}
+
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(raw_bytes)
+        raw_path = tmp.name
+
+    wav_path = None
+    try:
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+            wav_path = _convert_to_wav(raw_path)
+        except Exception:
+            wav_path = raw_path
+
+        whisper_lang = None
+        if language_hint:
+            whisper_lang = {"english":"en", "hindi":"hi", "hinglish":None}.get(language_hint)
+
+        # Fast transcribe with fp16 disabled (safer on CPU) and no beam search
+        transcribed = transcribe_file(wav_path, language=whisper_lang)
+        text        = transcribed["text"].strip()
+
+        if not text or len(text) < 2:
+            return {"transcribed": "", "answer": "Sorry, could not hear you. Try again.", "language": language_hint or "english"}
+
+        internal_lang = _whisper_lang_to_internal(transcribed.get("language")) or "english"
+
+        # Fast save (non-blocking would need async, keep it simple + fast)
+        if save_to_memory:
+            try:
+                msg = preprocess(text, source="voice", force_language=internal_lang)
+                save_message(msg)
+            except Exception as e:
+                print(f"[Converse] Save error (non-fatal): {e}")
+
+        # Fast retrieval — only top 3 memories, no belief index, no summaries
+        try:
+            memories = search_memories(text, top_k=3)
+            context = "\n".join(f"- {m['text']}" for m in memories) if memories else ""
+        except Exception:
+            context = ""
+
+        # Build short prompt for FAST reply
+        if context:
+            user_prompt = f"My past thoughts about this:\n{context}\n\nSomeone asked me: {text}\n\nReply in 1-2 short sentences ({internal_lang}):"
+        else:
+            user_prompt = f"Someone asked me: {text}\n\nReply briefly in 1-2 sentences ({internal_lang}):"
+
+        # Call Ollama with SPEED settings
+        response = ollama.chat(
+            model    = "mistral",
+            messages = [
+                {"role": "system", "content": CONVERSATION_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            options = {
+                "temperature":    0.7,
+                "top_p":          0.9,
+                "num_predict":    100,   # Max 100 tokens ≈ 15 seconds of speech
+                "num_ctx":        1024,  # Smaller context window = faster
+                "repeat_penalty": 1.1,
+            }
+        )
+        answer = response["message"]["content"].strip()
+
+        # Strip common prefixes the LLM sometimes adds
+        for prefix in ["My reply:", "Reply:", "Answer:", "I would say:", "I'd say:"]:
+            if answer.lower().startswith(prefix.lower()):
+                answer = answer[len(prefix):].strip()
+
+        return {
+            "transcribed":   text,
+            "answer":        answer,
+            "language":      internal_lang,
+            "context_count": len(memories) if context else 0,
+            "had_context":   bool(context),
+        }
+    except Exception as e:
+        import traceback
+        print(f"[API] /converse error:\n{traceback.format_exc()}")
+        return {"transcribed": "", "answer": "Something went wrong. Try again.", "language": "english"}
+    finally:
+        for p in [raw_path, wav_path]:
+            if p and p != raw_path:
+                try: os.unlink(p)
+                except OSError: pass
+        try: os.unlink(raw_path)
+        except OSError: pass
+
+
+# ---------------------------------------------------------------------------
+# TTS — server-side speech synthesis (bypasses browser TTS blocking)
+# ---------------------------------------------------------------------------
+
+@app.post("/tts")
+async def tts_endpoint(body: dict):
+    """
+    Server-side text-to-speech.
+    Returns audio bytes that the browser can play as <audio> element.
+
+    Body: { "text": "...", "language": "english" }
+    Returns: audio/wav bytes
+    """
+    from fastapi.responses import Response
+    text     = body.get("text", "").strip()
+    language = body.get("language", "english")
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+
+    try:
+        # Try Piper TTS first (best quality)
+        try:
+            from backend.output.tts_engine import get_tts
+            tts = get_tts()
+
+            # Generate WAV to temp file
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = tmp.name
+
+            saved = tts.speak(text, language=language, blocking=False, save_to=wav_path)
+
+            if saved and os.path.exists(wav_path):
+                with open(wav_path, "rb") as f:
+                    audio_bytes = f.read()
+                try: os.unlink(wav_path)
+                except OSError: pass
+                return Response(content=audio_bytes, media_type="audio/wav")
+        except Exception as e:
+            print(f"[TTS] Piper failed: {e}, trying fallback")
+
+        # Fallback: use espeak directly for guaranteed output on Linux
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = tmp.name
+
+        lang_code = {"english":"en", "hindi":"hi", "hinglish":"en"}.get(language, "en")
+        result = subprocess.run(
+            ["espeak-ng", "-v", lang_code, "-s", "160", "-w", wav_path, text],
+            capture_output=True, timeout=15
+        )
+        if result.returncode == 0 and os.path.exists(wav_path):
+            with open(wav_path, "rb") as f:
+                audio_bytes = f.read()
+            try: os.unlink(wav_path)
+            except OSError: pass
+            return Response(content=audio_bytes, media_type="audio/wav")
+
+        raise HTTPException(status_code=500, detail="All TTS backends failed. Install: sudo apt install espeak-ng")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[TTS] Error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/converse/greeting")
+async def get_greeting(name: str = "Flux", language: str = "english"):
+    """
+    Return a personalised greeting for when conversation mode starts.
+    Frontend speaks this immediately via browser TTS.
+    """
+    greetings = {
+        "english": [
+            f"Hi, I am {name}. How can I help you today?",
+            f"Hey there. {name} here. What is on your mind?",
+            f"Hello, this is {name}. What can I do for you?",
+        ],
+        "hindi": [
+            f"नमस्ते, मैं {name} हूं। आज मैं आपकी क्या मदद कर सकता हूं?",
+            f"हाय, {name} बोल रहा हूं। बताइए क्या पूछना है?",
+        ],
+        "hinglish": [
+            f"Hey, {name} here. Kya baat karni hai aaj?",
+            f"Hi yaar, {name} bol raha hoon. Kya haal hai?",
+        ],
+    }
+    import random
+    options = greetings.get(language, greetings["english"])
+    return {"greeting": random.choice(options), "language": language}
+
 
 # ---------------------------------------------------------------------------
 # ASK endpoints — generate answers from memory

@@ -24,10 +24,10 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "../../models/whisper")
 _model = None
 
 
-def get_model(size: str = "medium") -> whisper.Whisper:
+def get_model(size: str = "base") -> whisper.Whisper:
     """
     Load Whisper model once and reuse.
-    'medium' is recommended — handles Hindi and Hinglish well.
+    'base' is default — 5x faster than medium, good for conversation.
     Sizes: tiny | base | small | medium | large
     """
     global _model

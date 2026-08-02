@@ -218,7 +218,8 @@ def extract_entities(text: str) -> dict:
     dates = []
     for pattern in DATE_PATTERNS:
         found = re.findall(pattern, lower, re.IGNORECASE)
-        dates.extend(found if isinstance(found[0], str) else [f[0] for f in found] if found else [])
+        if found:
+            dates.extend(found if isinstance(found[0], str) else [f[0] for f in found])
 
     # Numbers
     numbers = [m.group() for m in NUMBER_PATTERN.finditer(text)]
