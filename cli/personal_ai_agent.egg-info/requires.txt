@@ -1,0 +1,9 @@
+openai-whisper
+sounddevice
+soundfile
+numpy
+webrtcvad
+lingua-language-detector
+ollama
+chromadb
+sentence-transformers

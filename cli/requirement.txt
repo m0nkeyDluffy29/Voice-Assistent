@@ -1,0 +1,16 @@
+# Voice + audio
+openai-whisper
+sounddevice
+soundfile
+numpy
+webrtcvad     # Voice activity detection (auto-stop on silence)
+
+# Language detection
+lingua-language-detector
+
+# LLM
+ollama
+
+# Memory (from your existing backend)
+chromadb
+sentence-transformers

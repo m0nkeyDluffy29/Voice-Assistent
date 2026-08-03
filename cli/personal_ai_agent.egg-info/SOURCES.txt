@@ -1,0 +1,8 @@
+flux.py
+pyproject.toml
+personal_ai_agent.egg-info/PKG-INFO
+personal_ai_agent.egg-info/SOURCES.txt
+personal_ai_agent.egg-info/dependency_links.txt
+personal_ai_agent.egg-info/entry_points.txt
+personal_ai_agent.egg-info/requires.txt
+personal_ai_agent.egg-info/top_level.txt
