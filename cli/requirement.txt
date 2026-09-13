@@ -1,9 +1,13 @@
 # Voice + audio
 openai-whisper
+faster-whisper
 sounddevice
 soundfile
 numpy
 webrtcvad     # Voice activity detection (auto-stop on silence)
+piper-tts     # Natural TTS voice (amy, kathleen, ...) — falls back to espeak-ng if missing
+yt-dlp>=2025.1  # YouTube search/resolve for the music skill — old apt versions break against YouTube
+pint          # Unit conversion in the calculator skill
 
 # Language detection
 lingua-language-detector

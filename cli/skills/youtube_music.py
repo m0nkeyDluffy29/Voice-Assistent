@@ -1,102 +1,174 @@
 """
-YouTube Music playback skill.
-Uses yt-dlp to search and mpv/vlc to play.
+YouTube Music playback skill — plays songs from YouTube using yt-dlp + mpv.
 
 Voice commands:
     "play [song name]"
-    "play [song name] on youtube"
-    "stop music" / "pause music" / "next"
+    "play [song name] by [artist]"
+    "stop music" / "pause music"
 """
 import subprocess
 import re
 import threading
-from pathlib import Path
+import os
+import signal
 
-TRIGGERS = ["play ", "music", "song", "youtube"]
-STOP_TRIGGERS = ["stop music", "pause music", "stop song", "pause song", "stop playing"]
+TRIGGERS = ["play ", "start playing", "put on"]
+STOP_TRIGGERS = ["stop music", "pause music", "stop song", "stop the music",
+                 "stop playing", "stop the song", "band karo", "music band"]
 
-# Track the currently playing process
-_current_process = None
+_current_pid = None
+_lock = threading.Lock()
 
 
 def can_handle(query: str) -> bool:
     q = query.lower().strip()
-    return any(t in q for t in TRIGGERS) or any(t in q for t in STOP_TRIGGERS)
+    if any(t in q for t in STOP_TRIGGERS):
+        return True
+    # Only handle "play" if it looks like a music request (not a game etc.)
+    if any(t in q for t in TRIGGERS):
+        # Skip common non-music phrases
+        if any(bad in q for bad in ["play chess", "play game", "play with", "play tennis"]):
+            return False
+        return True
+    return False
 
 
 def handle(query: str, agent_name: str, language: str) -> str:
-    global _current_process
     q = query.lower().strip()
 
-    # Handle stop commands
+    # Stop commands
     if any(t in q for t in STOP_TRIGGERS):
         return _stop_music()
 
-    # Extract song name — remove "play", "song", "on youtube", etc.
+    # Extract song name — remove trigger words
     song = q
-    for kw in ["play ", "on youtube", "youtube", "the song", "song", "for me", "please"]:
+    for kw in ["can you play", "please play", "play the song", "play song",
+               "play the", "start playing", "put on", "play "]:
         song = song.replace(kw, "")
-    song = song.strip()
+    # Remove trailing filler
+    for kw in [" on youtube", " youtube", " for me", " please", " now"]:
+        song = song.replace(kw, "")
+    song = song.strip(" .,?!")
 
     if not song or len(song) < 2:
         return "What song would you like to hear?"
 
+    # Verify mpv is installed
+    if not _has_command("mpv"):
+        return "I need mpv to play music. Install it with: sudo apt install mpv"
+
+    # Verify yt-dlp is installed
+    if not _has_command("yt-dlp"):
+        return "I need yt-dlp to search YouTube. Install it with: pip install yt-dlp"
+
+    # Resolve the direct audio stream URL ourselves before handing off to mpv.
+    # mpv's built-in ytdl_hook lets yt-dlp fall back through several YouTube
+    # client types (web, tv, android...) one at a time, which routinely takes
+    # 20-30s+ to land on one that works. Forcing the android_vr client here
+    # resolves in ~2-3s, so playback starts almost immediately.
+    stream_url = _resolve_stream_url(song)
+    if not stream_url:
+        return f"Couldn't find {song} on YouTube."
+
     # Stop anything currently playing
     _stop_music()
 
-    # Play in background thread so voice loop continues
-    threading.Thread(target=_play_song, args=(song,), daemon=True).start()
+    # Play in background — don't block conversation
+    threading.Thread(target=_play_song, args=(stream_url,), daemon=True).start()
 
     return f"Playing {song}"
 
 
-def _stop_music() -> str:
-    global _current_process
-    if _current_process and _current_process.poll() is None:
-        _current_process.terminate()
-        _current_process = None
-        return "Music stopped"
-
-    # Also try killing any lingering mpv/vlc
-    subprocess.run(["pkill", "-f", "mpv"], capture_output=True)
-    subprocess.run(["pkill", "-f", "vlc"], capture_output=True)
-    return "Music stopped"
+def _has_command(cmd: str) -> bool:
+    return subprocess.run(["which", cmd], capture_output=True).returncode == 0
 
 
-def _play_song(song: str):
-    global _current_process
-    try:
-        # yt-dlp search: ytsearch1: gives first result
-        search_query = f"ytsearch1:{song}"
+def _resolve_stream_url(song: str) -> str:
+    """
+    Search YouTube and return a direct playable audio URL.
+    Tries the fast android_vr client first (~2-3s); falls back to yt-dlp's
+    default multi-client resolution (slower, ~20-30s) if that yields nothing.
+    """
+    search_query = f"ytsearch1:{song}"
 
-        # Prefer mpv (lightweight), fall back to vlc
-        player = None
-        for p in ["mpv", "vlc", "cvlc"]:
-            if subprocess.run(["which", p], capture_output=True).returncode == 0:
-                player = p
-                break
-
-        if not player:
-            print("[youtube_music] No player found. Install: sudo apt install mpv")
-            return
-
-        if player == "mpv":
-            # mpv can handle yt-dlp URLs directly
-            _current_process = subprocess.Popen(
-                ["mpv", "--no-video", "--really-quiet", search_query],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        else:
-            # For VLC, we need to fetch the URL first with yt-dlp
+    for args, timeout in (
+        (["--extractor-args", "youtube:player_client=android_vr"], 15),
+        ([], 30),
+    ):
+        try:
             result = subprocess.run(
-                ["yt-dlp", "-f", "bestaudio", "-g", search_query],
-                capture_output=True, text=True, timeout=15,
+                ["yt-dlp", "-f", "bestaudio", "--no-playlist", *args, "-g", search_query],
+                capture_output=True, text=True, timeout=timeout,
             )
-            url = result.stdout.strip().split("\n")[0]
-            if url:
-                _current_process = subprocess.Popen(
-                    [player, "--intf", "dummy", "--no-video", url],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+            url = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+            if url.startswith("http"):
+                return url
+        except Exception:
+            continue
+    return None
+
+
+def _stop_music() -> str:
+    """Kill all mpv processes started by this session."""
+    global _current_pid
+    with _lock:
+        if _current_pid:
+            try:
+                os.killpg(os.getpgid(_current_pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            _current_pid = None
+
+    # Also kill any orphaned mpv processes with music playback
+    subprocess.run(["pkill", "-f", "mpv.*videoplayback"], capture_output=True)
+    subprocess.run(["pkill", "-f", "mpv.*ytsearch"], capture_output=True)
+    subprocess.run(["pkill", "-f", "mpv.*youtube"], capture_output=True)
+    return "Music stopped."
+
+
+def _play_song(stream_url: str):
+    """Play an already-resolved direct audio stream URL in mpv."""
+    global _current_pid
+
+    try:
+        # stream_url is a direct googlevideo link (resolved in _resolve_stream_url),
+        # so mpv doesn't need its own (slow) ytdl_hook resolution here.
+        process = subprocess.Popen(
+            [
+                "mpv",
+                "--no-video",           # audio only
+                "--really-quiet",       # no console spam
+                "--no-terminal",        # don't grab terminal
+                stream_url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,       # New process group so we can kill it cleanly
+        )
+
+        with _lock:
+            _current_pid = process.pid
+
+        # Wait for it — this thread stays alive while music plays
+        _, stderr = process.communicate()
+        if process.returncode not in (0, None) and stderr:
+            print(f"[youtube_music] mpv exited with error: {stderr.decode(errors='ignore').strip()[:300]}")
+
+        with _lock:
+            if _current_pid == process.pid:
+                _current_pid = None
+
     except Exception as e:
-        print(f"[youtube_music] Error playing '{song}': {e}")
+        print(f"[youtube_music] error: {e}")
+
+
+def status() -> str:
+    """Check if music is currently playing."""
+    global _current_pid
+    if _current_pid:
+        try:
+            os.kill(_current_pid, 0)   # Check if process exists
+            return "playing"
+        except ProcessLookupError:
+            _current_pid = None
+    return "stopped"

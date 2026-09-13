@@ -65,13 +65,18 @@ _vad_engine    = None
 CONFIG_PATH    = Path.home() / ".flux_config"
 
 def get_whisper():
-    """Load faster-whisper — 4x faster than openai-whisper, no numba dependency."""
+    """
+    Load faster-whisper with 'base' model for better accuracy.
+    Base is 3x slower than tiny but transcribes MUCH more accurately.
+    User can override via ~/.flux_config -> "whisper_size": "tiny" | "base" | "small"
+    """
     global _whisper_model
     if _whisper_model is None:
-        print(f"{C.GRAY}[boot] loading whisper tiny...{C.RESET}")
+        cfg = load_config()
+        size = cfg.get("whisper_size", "base")   # base = good sweet spot
+        print(f"{C.GRAY}[boot] loading whisper {size}...{C.RESET}")
         from faster_whisper import WhisperModel
-        # int8 quantization = tiny + very fast on CPU
-        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        _whisper_model = WhisperModel(size, device="cpu", compute_type="int8")
         print(f"{C.GRAY}[boot] whisper ready{C.RESET}")
     return _whisper_model
 
@@ -89,21 +94,107 @@ def get_vad():
 # ---------------------------------------------------------------------------
 # TTS — female voice via espeak-ng
 # ---------------------------------------------------------------------------
+# Try Piper TTS first — gives natural, human-like voice
+# Falls back to espeak-ng if Piper isn't installed
+_piper_available = None
+
+# Piper's own CLI only resolves a bare voice name (e.g. "en_US-amy-medium")
+# by looking for "<name>.onnx" in its --data-dir, which defaults to the
+# *current working directory* of the process. Since flux is a globally
+# installed CLI meant to run from any directory (SSH, cron, etc.), that
+# lookup silently fails unless you happen to be sitting in the one folder
+# that has the file. So we resolve the model to an absolute path ourselves
+# by checking a fixed list of well-known voice directories.
+PIPER_VOICE_DIRS = [
+    Path.home() / "piper_voices",
+    Path.home() / ".local" / "share" / "piper" / "voices",
+    Path(__file__).resolve().parent.parent / "models" / "tts",
+    Path.cwd(),
+]
+
+def _check_piper():
+    global _piper_available
+    if _piper_available is None:
+        try:
+            r = subprocess.run(["which", "piper"], capture_output=True, text=True, timeout=2)
+            _piper_available = bool(r.stdout.strip())
+        except Exception:
+            _piper_available = False
+    return _piper_available
+
+
+def _find_voice_model(voice_model: str):
+    """Look up '<voice_model>.onnx' across PIPER_VOICE_DIRS. Returns Path or None."""
+    for d in PIPER_VOICE_DIRS:
+        onnx_path = d / f"{voice_model}.onnx"
+        if onnx_path.exists():
+            return onnx_path
+    return None
+
+
 def speak(text: str, language: str = "english", blocking: bool = True):
-    """Speak text with espeak-ng using female voice settings."""
+    """
+    Speak text using the best available TTS engine.
+    Priority: Piper (natural voice) → espeak-ng (fallback, robotic).
+
+    Voice can be overridden via ~/.flux_config -> "voice": "amy" | "kathleen" | "libritts"
+    """
     if not text or not text.strip():
         return
 
-    voice_map = {"english": "en+f3", "hindi": "hi+f3", "hinglish": "en+f3"}
-    voice = voice_map.get(language, "en+f3")
+    # ── Try Piper first ──────────────────────────────────────
+    if _check_piper():
+        cfg = load_config()
+        voice = cfg.get("voice", "amy")   # amy = warm female, kathleen = softer, libritts = varied
+        voice_model = {
+            "amy":      "en_US-amy-medium",
+            "kathleen": "en_US-kathleen-low",
+            "kristin":  "en_US-kristin-medium",
+            "libritts": "en_US-libritts-high",
+            "kusal":    "en_US-kusal-medium",   # Indian English
+        }.get(voice, "en_US-amy-medium")
+
+        model_path = _find_voice_model(voice_model)
+        if model_path is None:
+            searched = ", ".join(str(d) for d in PIPER_VOICE_DIRS)
+            print(f"{C.YELLOW}[piper] voice '{voice_model}.onnx' not found — searched: {searched}{C.RESET}")
+            print(f"{C.YELLOW}[piper fallback → espeak]{C.RESET}")
+        else:
+            try:
+                # Piper writes raw PCM to stdout, aplay plays it
+                cmd_piper = ["piper", "--model", str(model_path), "--output-raw"]
+                cmd_aplay = ["aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-", "-q"]
+
+                p1 = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE)
+                p2 = subprocess.Popen(cmd_aplay, stdin=p1.stdout, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                p1.stdin.write(text.encode())
+                p1.stdin.close()
+                if blocking:
+                    p2.wait(timeout=30)
+                    p1.wait(timeout=5)
+                    if p1.returncode != 0:
+                        err = p1.stderr.read().decode(errors="ignore").strip()
+                        print(f"{C.YELLOW}[piper error] {err or 'unknown failure'} — falling back to espeak{C.RESET}")
+                    else:
+                        return
+                else:
+                    return
+            except Exception as e:
+                print(f"{C.YELLOW}[piper fallback → espeak] {e}{C.RESET}")
+
+    # ── Fallback: espeak-ng with better female voice ─────────
+    voice_map = {"english": "en+f2", "hindi": "hi+f3", "hinglish": "en-us+f2"}
+    voice = voice_map.get(language, "en+f2")
 
     cmd = [
         "espeak-ng",
         "-v", voice,
-        "-p", "60",       # Pitch (higher = more female)
-        "-s", "160",      # Words per minute
-        "-a", "180",      # Amplitude/volume
-        "-g", "3",        # Small gap between words
+        "-p", "55",       # Slightly lower pitch = warmer
+        "-s", "150",      # Slower = clearer, more natural
+        "-a", "200",      # Louder
+        "-g", "5",        # Bigger word gap = more natural rhythm
         text,
     ]
 
@@ -113,7 +204,7 @@ def speak(text: str, language: str = "english", blocking: bool = True):
         else:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
-        print(f"{C.RED}[error] espeak-ng not found. Install: sudo apt install espeak-ng{C.RESET}")
+        print(f"{C.RED}[error] Install: sudo apt install espeak-ng{C.RESET}")
     except subprocess.TimeoutExpired:
         pass
 
@@ -196,13 +287,30 @@ def record_until_silence(max_seconds: int = 15, silence_ms: int = 1200, language
     lang_code = {"english": "en", "hindi": "hi", "hinglish": None}.get(language)
 
     try:
-        # faster-whisper returns segments, we join them
+        # Provide context so Whisper transcribes common commands correctly
+        initial_prompt = (
+            "The user is talking to a voice assistant named Flux. "
+            "They may ask to play music, check weather, set reminders, "
+            "control volume, ask questions, or have a conversation."
+        )
+        # beam_size/best_of > 1 multiply decode cost roughly linearly (5x each
+        # was ~3x slower on a 3s clip in testing) for a small accuracy gain.
+        # Default to greedy decoding for a fast reaction time; override via
+        # ~/.flux_config -> "whisper_beam_size" / "whisper_best_of" if you'd
+        # rather trade speed for accuracy.
+        cfg = load_config()
+        beam_size = cfg.get("whisper_beam_size", 1)
+        best_of   = cfg.get("whisper_best_of", 1)
         segments, info = model.transcribe(
             audio_array,
-            language     = lang_code,
-            beam_size    = 1,          # Fastest — greedy decode
-            vad_filter   = False,      # We already did VAD
-            temperature  = 0.0,
+            language          = lang_code,
+            beam_size          = beam_size,
+            best_of            = best_of,
+            vad_filter         = False,
+            temperature        = 0.0,
+            initial_prompt     = initial_prompt, # Context helps recognition
+            condition_on_previous_text = False,  # Don't hallucinate follow-ups
+            no_speech_threshold = 0.6,           # Filter out silence better
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         print(" " * 40, end="\r")
